@@ -1,0 +1,8 @@
+---
+other:
+  - |
+    profiling: Adds a per-way lasti-to-line cache in the heap profiler's
+    ``CodeFunctionCache``, skipping ``parse_linetable`` on repeated
+    allocation sites. Also introduces the
+    ``DD_PROFILING_MEMALLOC_CODE_CACHE_SIZE`` setting (default 1024) to
+    control cache capacity.
