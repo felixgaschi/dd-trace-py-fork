@@ -1,7 +1,24 @@
 #include <string_view>
 
 #include "_memalloc_frame.h"
+
+#include "_memalloc_code_cache.h"
 #include "_memalloc_tb.h"
+
+/* Parse the line number for (code, lasti) without calling PyCode_Addr2Line.
+ * Takes lasti directly so callers that already computed it don't do it twice. */
+static inline int
+resolve_lineno(PyCodeObject* code, int lasti)
+{
+#ifdef _PY310_AND_LATER
+    const unsigned char* table = (const unsigned char*)PyBytes_AS_STRING(code->co_linetable);
+    Py_ssize_t len = PyBytes_GET_SIZE(code->co_linetable);
+#else
+    const unsigned char* table = (const unsigned char*)PyBytes_AS_STRING(code->co_lnotab);
+    Py_ssize_t len = PyBytes_GET_SIZE(code->co_lnotab);
+#endif
+    return DataDog::parse_linetable(table, len, lasti, code->co_firstlineno);
+}
 
 /* Extract a UTF-8 string_view from a Python unicode object without any
  * CPython API calls that could allocate, free, or touch error state.
@@ -100,11 +117,41 @@ push_stacktrace_to_sample_no_refcount(Datadog::Sample& sample, uint16_t max_nfra
             continue;
         }
 
+        int lasti = DataDog::get_lasti(frame, code);
+
+        Datadog::CodeFunctionCache* cache = Datadog::CodeFunctionCache::instance;
+        if (cache != nullptr) {
+            Datadog::CacheHit hit = cache->lookup(code, lasti);
+            if (hit.func_id != nullptr) {
+                /* Code-cache hit. hit.line >= 0 means lasti matched and the
+                 * cached line is valid; -1 means lasti changed so resolve once.
+                 * Returned as a plain 16B struct (register ABI, no stack copy). */
+                int line = hit.line >= 0 ? hit.line : resolve_lineno(code, lasti);
+                sample.push_frame(hit.func_id, 0, line);
+                ++pushed_frames;
+                continue;
+            }
+        }
+
+        /* Full cache miss: intern strings, resolve line, then insert. */
+        int line = resolve_lineno(code, lasti);
         std::string_view name_sv = unicode_to_sv_no_alloc(DataDog::get_code_name(code));
         std::string_view filename_sv = unicode_to_sv_no_alloc(code->co_filename);
-        int line = memalloc_get_lineno(frame, code);
 
-        sample.push_frame(name_sv, filename_sv, 0, line);
+        std::optional<Datadog::string_id> name_id = Datadog::intern_string(name_sv);
+        std::optional<Datadog::string_id> filename_id = Datadog::intern_string(filename_sv);
+        if (!name_id || !filename_id) {
+            continue;
+        }
+        std::optional<Datadog::function_id> func_id = Datadog::intern_function(*name_id, *filename_id);
+        if (!func_id) {
+            continue;
+        }
+
+        if (cache != nullptr) {
+            cache->insert(code, *func_id, lasti, line);
+        }
+        sample.push_frame(*func_id, 0, line);
         ++pushed_frames;
     }
 }
