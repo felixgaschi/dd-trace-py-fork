@@ -630,7 +630,10 @@ def test_ddwaf_run_contained_typeerror(tracer, caplog):
 
     with (
         caplog.at_level(logging.DEBUG),
-        mock.patch("ddtrace.appsec._ddwaf.waf.ddwaf_run", side_effect=TypeError("expected c_long instead of int")),
+        mock.patch(
+            "ddtrace.appsec._ddwaf.waf.ddwaf_context_eval",
+            side_effect=TypeError("expected c_long instead of int"),
+        ),
     ):
         with asm_context(tracer=tracer, config=config_asm) as span:
             set_http_meta(
@@ -667,7 +670,7 @@ def test_ddwaf_run_contained_oserror(tracer, caplog):
 
     with (
         caplog.at_level(logging.DEBUG),
-        mock.patch("ddtrace.appsec._ddwaf.waf.ddwaf_run", side_effect=OSError("ddwaf run failed")),
+        mock.patch("ddtrace.appsec._ddwaf.waf.ddwaf_context_eval", side_effect=OSError("ddwaf run failed")),
     ):
         with asm_context(tracer=tracer, config=config_asm) as span:
             set_http_meta(
@@ -919,3 +922,67 @@ def test_lambda_inferred_span(tracer, inferred_span_name):
     assert gateway_span.get_metric(APPSEC.ENABLED) == 1.0
     assert get_triggers(lambda_span)
     assert get_triggers(gateway_span)
+
+
+def test_rasp_subcontext_scope_shared_for_ssrf():
+    """A nested SSRF operation (e.g. requests driving urllib3) must share ONE subcontext.
+
+    The reentrant open/close must not let an inner scope clobber the outer holder, and
+    SSRF_REQ + SSRF_RES of the same outgoing request must resolve the same subcontext.
+    """
+    from ddtrace.appsec import _asm_request_context as arc
+    from ddtrace.internal import core
+
+    class _FakeSubctx:
+        pass
+
+    class _FakeWaf:
+        def __init__(self):
+            self.created = 0
+
+        def new_subcontext(self, ctx):
+            self.created += 1
+            return _FakeSubctx()
+
+    waf = _FakeWaf()
+    main_ctx = object()
+    with core.context_with_data("outer_request"):
+        assert arc.open_rasp_subcontext_scope() is True
+        s_req = arc.get_or_create_rasp_subcontext(waf, main_ctx, "ssrf_req")
+        # Inner client opens a nested scope: it must detect the parent holder and not create one.
+        with core.context_with_data("inner_send"):
+            opened_inner = arc.open_rasp_subcontext_scope()
+            assert opened_inner is False
+            s_inner = arc.get_or_create_rasp_subcontext(waf, main_ctx, "ssrf_req")
+            assert s_inner is s_req
+            arc.close_rasp_subcontext_scope(opened_inner)  # must be a no-op
+        # Final response on the outer scope still shares the same subcontext.
+        s_res = arc.get_or_create_rasp_subcontext(waf, main_ctx, "ssrf_res")
+        assert s_res is s_req
+    assert waf.created == 1
+
+
+def test_rasp_subcontext_fresh_per_non_ssrf_call():
+    """LFI/CMDI/SHI/SQLI must get a fresh subcontext on every call (one per guarded operation)."""
+    from ddtrace.appsec import _asm_request_context as arc
+    from ddtrace.internal import core
+
+    class _FakeSubctx:
+        pass
+
+    class _FakeWaf:
+        def __init__(self):
+            self.created = 0
+
+        def new_subcontext(self, ctx):
+            self.created += 1
+            return _FakeSubctx()
+
+    waf = _FakeWaf()
+    main_ctx = object()
+    with core.context_with_data("request"):
+        arc.open_rasp_subcontext_scope()
+        a = arc.get_or_create_rasp_subcontext(waf, main_ctx, "lfi")
+        b = arc.get_or_create_rasp_subcontext(waf, main_ctx, "lfi")
+        assert a is not b
+    assert waf.created == 2

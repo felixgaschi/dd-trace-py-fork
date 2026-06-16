@@ -318,9 +318,24 @@ class AppSecSpanProcessor(SpanProcessor):
             return None
 
         try:
-            waf_results = self._ddwaf.run(
-                ctx, data, ephemeral_data=ephemeral_data or None, timeout_ms=asm_config._waf_timeout
-            )
+            if rule_type is None:
+                # Request-related data (request lifecycle, API Security extract-schema, user/
+                # business-logic events) is evaluated on the main per-request context.
+                waf_results = self._ddwaf.run(
+                    ctx, data, ephemeral_data=ephemeral_data or None, timeout_ms=asm_config._waf_timeout
+                )
+            else:
+                # RASP data is non-persisting: evaluate it on a subcontext (one per guarded
+                # operation; shared across an SSRF request's SSRF_REQ + SSRF_RES calls). Fall
+                # back to the main context if a subcontext could not be created.
+                subctx = _asm_request_context.get_or_create_rasp_subcontext(self._ddwaf, ctx, rule_type)
+                waf_results = self._ddwaf.run(
+                    subctx or ctx,
+                    data,
+                    ephemeral_data=ephemeral_data or None,
+                    timeout_ms=asm_config._waf_timeout,
+                    is_subcontext=subctx is not None,
+                )
         except Exception:
             log.debug("appsec::processor::waf::run", exc_info=True)
             waf_results = Binding_error

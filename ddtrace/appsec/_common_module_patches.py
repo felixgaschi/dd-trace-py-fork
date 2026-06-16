@@ -6,7 +6,9 @@ from typing import Union
 
 from ddtrace.appsec._asm_request_context import _get_asm_context
 from ddtrace.appsec._asm_request_context import call_waf_callback
+from ddtrace.appsec._asm_request_context import close_rasp_subcontext_scope
 from ddtrace.appsec._asm_request_context import get_blocked
+from ddtrace.appsec._asm_request_context import open_rasp_subcontext_scope
 from ddtrace.appsec._constants import EXPLOIT_PREVENTION
 from ddtrace.appsec._constants import WAF_ACTIONS
 from ddtrace.appsec._contrib.stripe.patch import patch as patch_stripe_for_appsec
@@ -289,6 +291,8 @@ def wrapped_open_ED4CF71136E15EBF(original_open_callable, instance, args, kwargs
         if valid_url and url and (ctx := _get_asm_context()):
             use_body = should_analyze_body_response(ctx)
             with core.context_with_data("url_open_analysis", full_url=url, use_body=use_body):
+                # This outgoing request's SSRF_REQ + SSRF_RES WAF calls share one subcontext.
+                open_rasp_subcontext_scope()
                 # API10, doing all request calls in HTTPConnection.request
                 try:
                     response = original_open_callable(*args, **kwargs)
@@ -335,7 +339,15 @@ def wrapped_urllib3_make_request_6D4E8B2A1F095C73(original_request_callable, ins
     full_url = core.find_item("full_url")
     env = _get_asm_context()
     do_rasp = _get_rasp_capability("ssrf") and full_url is not None and env is not None
-    if do_rasp:
+    if not do_rasp:
+        return original_request_callable(*args, **kwargs)
+    # This outgoing request's SSRF_REQ + SSRF_RES WAF calls (request and response happen in this
+    # single function) share one subcontext. urllib3 has no dedicated per-request core context
+    # here, so we open and close the subcontext scope explicitly. When urllib3 is driven by an
+    # outer client that already opened a scope (e.g. requests), this is a no-op and we must not
+    # close the parent's scope, hence threading the ``opened`` flag through.
+    opened_subcontext_scope = open_rasp_subcontext_scope()
+    try:
         use_body = core.find_item("use_body", False)
         method = args[1] if len(args) > 1 else kwargs.get("method", None)
         body = args[3] if len(args) > 3 else kwargs.get("body", None)
@@ -356,18 +368,20 @@ def wrapped_urllib3_make_request_6D4E8B2A1F095C73(original_request_callable, ins
         core.discard_item("full_url")
         if res and _must_block(res.actions):
             raise BlockingException(get_blocked(), EXPLOIT_PREVENTION.BLOCKING, EXPLOIT_PREVENTION.TYPE.SSRF, full_url)
-    response = original_request_callable(*args, **kwargs)
-    try:
-        if do_rasp and response.__class__.__name__ == "BaseHTTPResponse" and 300 <= response.status < 400:
-            # api10 for redirected response status and headers in urllib3
-            addresses = {
-                "DOWN_RES_STATUS": str(response.status),
-                "DOWN_RES_HEADERS": response.headers,
-            }
-            call_waf_callback(addresses, rule_type=EXPLOIT_PREVENTION.TYPE.SSRF_RES)
-    except Exception:
-        pass  # nosec
-    return response
+        response = original_request_callable(*args, **kwargs)
+        try:
+            if response.__class__.__name__ == "BaseHTTPResponse" and 300 <= response.status < 400:
+                # api10 for redirected response status and headers in urllib3
+                addresses = {
+                    "DOWN_RES_STATUS": str(response.status),
+                    "DOWN_RES_HEADERS": response.headers,
+                }
+                call_waf_callback(addresses, rule_type=EXPLOIT_PREVENTION.TYPE.SSRF_RES)
+        except Exception:
+            pass  # nosec
+        return response
+    finally:
+        close_rasp_subcontext_scope(opened_subcontext_scope)
 
 
 def wrapped_urllib3_urlopen(original_open_callable, instance, args, kwargs):
@@ -401,6 +415,8 @@ def wrapped_request_D8CB81E472AF98A2(original_request_callable, instance, args, 
         if valid_url and url and (ctx := _get_asm_context()):
             use_body = should_analyze_body_response(ctx)
             with core.context_with_data("url_open_analysis", full_url=url, use_body=use_body):
+                # This outgoing request's SSRF_REQ + SSRF_RES WAF calls share one subcontext.
+                open_rasp_subcontext_scope()
                 # API10, doing all request calls in HTTPConnection.request
                 try:
                     response = original_request_callable(*args, **kwargs)
